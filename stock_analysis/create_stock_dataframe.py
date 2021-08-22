@@ -9,6 +9,9 @@ from scipy.stats import pearsonr
 import matplotlib.pyplot as plt
 import scipy.fftpack
 from stock_analysis.ml_utils import train_XGB
+from darts import TimeSeries
+from darts.models import ExponentialSmoothing, ExponentialSmoothing, ARIMA, RNNModel, TCNModel
+from darts.utils.missing_values import fill_missing_values
 
 def correlate_dict(portfolio, stock, date_only_dict, up_or_down_list):
     hour_dict = {}
@@ -352,6 +355,57 @@ def create_stock_dataframe(portfolio, timeframe, is_plot=False):
         #Add Stats to Portfolio dict
         portfolio[stock]['stock_stats'] = {'volume_stats': volume_stats, 'price_stats': price_stats}
         df_5d_price = create_5d_df(portfolio, stock, timeframe)
+
+        # Timeseries Playground
+        models = [ExponentialSmoothing, RNNModel, TCNModel] #ARIMA,,
+        for model in models:
+            # 10 min period intra-day - 5 Days data
+            plt.close()
+            period = 24*60/10 # 24H*(60Min/10Min)
+            if model == ExponentialSmoothing :
+                curr_model = model(seasonal_periods=period)
+            else:
+                curr_model = model()
+            series = TimeSeries.from_dataframe(df_5d_price, 'DateTime', 'Price', freq='10min', fill_missing_dates=True)
+            series.plot()
+            methods = ['linear','quadratic','cubic','slinear','piecewise']
+            for method in methods:
+                series = fill_missing_values(series,'auto',interpolate_kwargs={'method':method})
+                len_20_percent = int(len(series)*0.2)
+                train, val = series[:-len_20_percent], series[-len_20_percent:]
+
+                curr_model.fit(train)
+                prediction = curr_model.predict(len(val), num_samples=1000)
+                prediction.plot(label=f'{model.__str__(model)} forecast;  Interpolation :{method}', low_quantile=0.05, high_quantile=0.95)
+
+            # 1 Day period  120 business Days data
+            plt.close()
+            period = 7 # 7 days
+            if model == ExponentialSmoothing :
+                curr_model = model(seasonal_periods=period)
+            else:
+                curr_model = model()
+            series = TimeSeries.from_dataframe(df_price_frame, 'DateTime', 'Price', freq='D', fill_missing_dates=True)
+            series.plot()
+            methods = ['linear','quadratic','cubic','slinear','piecewise']
+            for method in methods:
+                series = fill_missing_values(series,'auto',interpolate_kwargs={'method':method})
+                len_20_percent = int(len(series)*0.2)
+                train, val = series[:-len_20_percent], series[-len_20_percent:]
+
+                curr_model.fit(train)
+                prediction = curr_model.predict(len(val), num_samples=1000)
+                prediction.plot(label=f'{model.__str__(model)} forecast;  Interpolation :{method}', low_quantile=0.05, high_quantile=0.95)
+
+
+        # model = AutoARIMA()
+        # model.fit(train)
+        # prediction = model.predict(len(val))
+        # series.plot()
+        # prediction.plot(label='forecast-ARIMA', low_quantile=0.05, high_quantile=0.95)
+        # plt.legend()
+
+
 
 #######################################################################        #####Continue HERE~!
         plot_fft(df_price_month)

@@ -3,6 +3,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
 def train_XGB(X, y, X_cols, is_plot=False):
