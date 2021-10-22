@@ -5,45 +5,63 @@ import json
 from dateutil import parser
 import math
 import calc_stock_hour_correlation
+from tqdm import tqdm
+
 
 
 def get_tip_data(symbol, session):
     ms = int(datetime.datetime.now().timestamp() * 1000)
-    sym = symbol[0].strip('') if isinstance(symbol, list) else symbol.strip('')
+    sym = symbol[0].strip('').lower() if isinstance(symbol, list) else symbol.strip('').lower()
     # res = requests.get("https://www.tipranks.com/stocks/spwr/stock-analysis")
     tip_data = defaultdict(dict)
+    top_stocks_list = []
     try:
+        res_azure = session.get(f"https://tr-frontend-cdn.azureedge.net/bff/prod/stock/{sym}/payload.json?ver={ms}")
+
         res = session.get(
             "https://www.tipranks.com/api/stocks/getData/?name={}&benchmark=1&period=3&break={}".format(sym, ms))
         res_ticker = session.get(
             "https://www.tipranks.com/api/stocks/getChartPageData/?ticker={}&benchmark=1&period=3&break={}".format(sym,
                                                                                                                    ms))
+
         res.raise_for_status()
         date_dicts = defaultdict(dict)
         # Sort by dates
-        for data in res.json()['consensusOverTime']:
-            date_dicts[data['date']] = data
+        if (res.headers.get('content-type') == 'application/json'):
+            for data in res.json()['consensusOverTime']:
+                date_dicts[data['date']] = data
 
         # Add to Tipranks stock data
-        tip_data['consensusOverTime'] = date_dicts
-        tip_data['bloggerSentiment'] = res.json()['bloggerSentiment']
-        tip_data['similarStocks'] = res.json()['similarStocks']
-        tip_data['topStocksBySector'] = res.json()['topStocksBySector']
-        tip_data['tipranksStockScore'] = res.json()['tipranksStockScore']
-        tip_data['ticker_data'] = res_ticker.json() if res_ticker else []
+            tip_data['consensusOverTime'] = date_dicts
+            tip_data['bloggerSentiment'] = res.json()['bloggerSentiment']
+            tip_data['topStocksBySector'] = res.json()['topStocksBySector']
+            tip_data['tipranksStockScore'] = res.json()['tipranksStockScore']
+
+        if (res_azure.headers.get('content-type') == 'application/json'):
+            tip_data['ticker_data'] = res_ticker.json() if res_ticker else []
+            tip_data['azure_data'] = res_azure.json() if res_azure else []
+            tip_data['similarStocks'] = res_azure.json()['similar']['similar'] if res_azure.json()['similar']['isHaveData'] else []
+            for sector in ['analysts','investors','bloggers','insiders','news']:
+                top_stocks_list += res_azure.json()[sector]['topStocks'] if res_azure.json()[sector]['isHaveData'] else top_stocks_list
+            tip_data['topStocksBySector'] = top_stocks_list if not tip_data.get('topStocksBySector',None) else tip_data.get('topStocksBySector',None)
         return tip_data
     except requests.exceptions.HTTPError:
         return tip_data
+    except:
+        raise Exception(f"Tiprank Data Error - {symbol}")
 
 
 def get_6m_price(stocks, days_ago, session):
-    res = session.post(url='https://www.marketbeat.com/Pages/CompareStocks.aspx/GetChartData',
-                       json={'stocks': [stocks[0]], 'lookback': days_ago})
-    date_dicts = defaultdict(dict)
-    # Sort by dates
-    for data in res.json()['d']['StockRows']:
-        date_dicts[data['ItemDate']][data['Symbol']] = data
-    return date_dicts
+    try:
+        res = session.post(url='https://www.marketbeat.com/Pages/CompareStocks.aspx/GetChartData',
+                           json={'stocks': [stocks[0]], 'lookback': days_ago})
+        date_dicts = defaultdict(dict)
+        # Sort by dates
+        for data in res.json()['d']['StockRows']:
+            date_dicts[data['ItemDate']][data['Symbol']] = data
+        return date_dicts
+    except:
+        raise Exception(f"Marketbeat Data Error - {stocks}")
 
 
 def get_stock_price_sa(symbol, session):
@@ -75,6 +93,9 @@ def get_stock_price_sa(symbol, session):
     except requests.exceptions.HTTPError:
         print("Error getting Seeking Alpha data - {} stock".format(symbol))
         return all_stock_dict
+
+    except:
+        raise Exception(f"Seeking Alpha Data Error - {symbol}")
 
 
 def rank_tip_accuracy(portfolio):
@@ -121,13 +142,13 @@ def add_similar_stocks(stock_data, stock, spdr_etfs, source_field_name, target_f
     if stock_data['Tiprank'].get(source_field_name, None):
         # Adds similar stocks
         for sim in stock_data['Tiprank'][source_field_name]:
-            if source_field_name != 'topStocksBySector':
-                symbol = sim['ticker']
-                similar_stocks[symbol] = symbol if symbol not in similar_stocks.keys() else None
-            else:
-                for recommenders in stock_data['Tiprank'][source_field_name][sim]:
-                    symbol = recommenders['ticker']
-                    similar_stocks[symbol] = symbol if symbol not in similar_stocks.keys() else None
+            # if source_field_name != 'topStocksBySector':
+            symbol = sim['ticker']
+            similar_stocks[symbol] = symbol if symbol not in similar_stocks.keys() else similar_stocks[symbol]
+            # else:  # TODO: deprecated
+            #     for recommenders in stock_data['Tiprank'][source_field_name][sim]:
+            #         symbol = recommenders['ticker']
+            #         similar_stocks[symbol] = symbol if symbol not in similar_stocks.keys() else None
     # Handles ETFs not in Tipranks data -
     if stock in spdr_etfs:
         for etf in spdr_etfs:
@@ -136,38 +157,46 @@ def add_similar_stocks(stock_data, stock, spdr_etfs, source_field_name, target_f
 
 
 def create_portfolio(stocks):
+    exceptions_list = []
     # Default symbols for SPDR ETF's
     spdr_etfs = ['XLC', 'XLY', 'XLP', 'XLE', 'XLF', 'XLV', 'XLI', 'XLB', 'XLRE', 'XLK', 'XLU']
     # Default for Marketbeat.com - in order to get 6 months stock history
     days_ago = 180
     portfolio = defaultdict(dict)
-    session = requests.session()
+    session = requests.sessions.Session()
     has_amount = isinstance(stocks[0], list)
     # Deals when it only gets a list of stock symbols (not in format of [stock symbol, stock amount])
     if has_amount:
         stocks_symbols = [x[0] for x in stocks]
     else:
         stocks_symbols = stocks
-    for stock in stocks_symbols:
-        stock_data = defaultdict(dict)
-        # adds Tiprank stock data
-        stock_data['Tiprank'] = get_tip_data(stock, session)
-        add_similar_stocks(stock_data, stock, spdr_etfs, 'similarStocks',
-                           'similar_stocks')  # creates similar stocks data
-        add_similar_stocks(stock_data, stock, spdr_etfs, 'topStocksBySector',
-                           'top_stocks')  # creates top stocks by sector data
-        # Adds stock prices
-        stock_data['stock_data'] = get_stock_price_sa(stock, session)  # Seeking Alpha
-        stock_data['stock_data']['6M_Marketbeat'] = get_6m_price([stock], days_ago, session)  # Marketbeat
-        # Appends stock data to Portfolio
-        portfolio[stock] = stock_data
-        # Adds amounts for each stock (if exists)
-        if has_amount:
-            portfolio[stock]['amount'] = [t[1] for t in stocks if t[0] == stock][0]
-        else:
+    print("Creating Stock Portfolio")
+    for stock in tqdm(stocks_symbols, desc= 'Stocks Portfolio'):
+        try:
+            stock_data = defaultdict(dict)
+            # adds Tiprank stock data
+            stock_data['Tiprank'] = get_tip_data(stock, session)
+            add_similar_stocks(stock_data, stock, spdr_etfs, 'similarStocks',
+                               'similar_stocks')  # creates similar stocks data
+            add_similar_stocks(stock_data, stock, spdr_etfs, 'topStocksBySector',
+                               'top_stocks')  # creates top stocks by sector data
+            # Adds stock prices
+            stock_data['stock_data'] = get_stock_price_sa(stock, session)  # Seeking Alpha
+            stock_data['stock_data']['6M_Marketbeat'] = get_6m_price([stock], days_ago, session)  # Marketbeat
+            # Appends stock data to Portfolio
+            portfolio[stock] = stock_data
+            # Adds amounts for each stock (if exists)
+            if has_amount:
+                portfolio[stock]['amount'] = [t[1] for t in stocks if t[0] == stock][0]
+            else:
+                continue
+        except Exception as e:
+            exceptions_list += [str(e)]
             continue
     # Adds Tiprank analyst accuracy over the past 6 months
     rank_tip_accuracy(portfolio)
+    for exception in exceptions_list:
+        print(exception)
     return portfolio
 
 
@@ -244,12 +273,14 @@ def calc_performance(portfolio, test, period, end_date=datetime.datetime.today()
             else:
                 continue
         rival_list = list(rival_stocks.keys())
+        print("Creating Similar/Top Stocks Portfolio")
         rival_portfolio = create_portfolio(rival_list)
         for s in rival_portfolio:
             calc_stock_hour_correlation.stock_hour_correlation(rival_portfolio, s)
         # Save Portfolio to file
         json_r = json.dumps(rival_portfolio)
-        f = open("22.4_RIVAL.json", "w")
+        str_today = str(datetime.datetime.today().date()).replace('-','_')
+        f = open(str_today + "_similar.json", "w")
         f.write(json_r)
         f.close()
     periods = [7, 14, 30]  # Default Periods

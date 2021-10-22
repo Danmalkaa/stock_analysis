@@ -1,17 +1,52 @@
 from typing import List, Any
 import datetime
-import numpy as np
+# import numpy as np
 from sklearn import preprocessing
-import pandas as pd
+# import pandas as pd
 import statistics as stat
 from dateutil import parser
 from scipy.stats import pearsonr
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 import scipy.fftpack
 from stock_analysis.ml_utils import train_XGB
-from darts import TimeSeries
-from darts.models import ExponentialSmoothing, ExponentialSmoothing, ARIMA, RNNModel, TCNModel
+# from darts import TimeSeries
+from darts.models import ExponentialSmoothing, ExponentialSmoothing, ARIMA, RNNModel, TCNModel, KalmanFilter
 from darts.utils.missing_values import fill_missing_values
+
+# # Darts Example
+# import sys
+# import time
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+# from functools import reduce
+
+from darts import TimeSeries
+from darts.models import (
+    NaiveSeasonal,
+    NaiveDrift,
+    Prophet,
+    ExponentialSmoothing,
+    ARIMA,
+    AutoARIMA,
+    RegressionEnsembleModel,
+    RegressionModel,
+    Theta,
+    FFT
+)
+
+from darts.metrics import mape, mase
+# from darts.utils.statistics import check_seasonality, plot_acf, plot_residuals_analysis
+# from darts.datasets import AirPassengersDataset
+
+import warnings
+warnings.filterwarnings("ignore")
+import logging
+logging.disable(logging.CRITICAL)
+from tqdm import tqdm
+
+
+
 
 def correlate_dict(portfolio, stock, date_only_dict, up_or_down_list):
     hour_dict = {}
@@ -340,152 +375,370 @@ def plot_fft(df):
     ax[2].legend(loc="upper right")
     plt.show()
 
+def search_theta(train, val):
+    # Search for the best theta parameter, by trying 50 different values
+    thetas = 2 - np.linspace(-10, 10, 50)
+
+    best_mape = float('inf')
+    best_theta = 0
+
+    for theta in thetas:
+        model = Theta(theta)
+        model.fit(train)
+        pred_theta = model.predict(len(val))
+        res = mape(val, pred_theta)
+
+        if res < best_mape:
+            best_mape = res
+            best_theta = theta
+    return best_theta
+
+def train_theta(train, val, best_theta):
+    best_theta_model = Theta(best_theta)
+    best_theta_model.fit(train)
+    pred_best_theta = best_theta_model.predict(len(val))
+
+    print('The MAPE is: {:.2f}, with theta = {}.'.format(mape(val, pred_best_theta), best_theta))
+    return pred_best_theta
+
+
+def eval_model(model, train, val, is_filtered=None):
+    model.fit(train)
+    forecast = model.predict(len(val))
+    if not is_filtered:
+        print('model {} obtains MAPE: {:.2f}%'.format(model, mape(val, forecast)))
+        forecast.plot(label=f'{model} forecast ', low_quantile=0.05, high_quantile=0.95)
+    else:
+        print('model {} , filtered, obtains MAPE: {:.2f}%'.format(model, mape(val, forecast)))
+        forecast.plot(label=f'{model} , filtered, forecast ', low_quantile=0.05, high_quantile=0.95)
+    return mape(val, forecast)
+
+
+def search_best_forecast_period(model, data):
+    best_day = 0
+    raw_errors = []
+    best_average_error = float('inf')
+    for day in tqdm(range(3, 14), desc= 'Backtesting', colour='green'):
+        average_error = model.backtest(data, start=0.8, forecast_horizon=day, verbose=False)
+        if average_error < best_average_error:
+            best_average_error = average_error
+            best_day = day
+        raw_errors += [(day, average_error)]
+
+    return raw_errors, best_day
+
+
+def plot_hist_with_counts(data):
+    """
+    histogram with counts - counts how many times a certain data occured in a bin (range)
+    e.g. 13 times in the range 0-0.5
+
+    * Need to add title manually outside the function
+    :param data:
+    :return:
+    """
+    if isinstance(data[0],tuple):
+        series = [x[1] for x in data]
+        bins_data = np.arange(0, max(series), 1)
+    else:
+        series = data
+        bins_data = np.arange(0, max(data), 1)
+    density, bins, _ = plt.hist(series, density=True, bins=bins_data)
+    count, _ = np.histogram(series, bins)
+    for x, y, num in zip(bins, density, count):
+        if num != 0:
+            plt.text(x, y + 0.005, num, fontsize=10, rotation=-90)  # x,y,str
+    plt.show()
+
+
+def search_best_model(train, val, train_f, val_f, method,  best_mape, best_model, best_method):
+    for model_eval in [ExponentialSmoothing(), Prophet(), AutoARIMA(), Theta()]:
+        res = eval_model(model_eval, train, val)
+        res_f = eval_model(model_eval, train_f, val_f, is_filtered=True)
+        if res < best_mape:
+            best_mape = res
+            best_model = model_eval
+            best_method = method
+        if res_f < best_mape:
+            best_mape = res
+            best_model = model_eval
+            best_method = method
+    return best_mape, best_model, best_method
+
 
 def create_stock_dataframe(portfolio, timeframe, is_plot=False):
-    for stock in portfolio:
-        # Create DataFrames
-        df_price_frame = create_dataframe(portfolio, stock, timeframe)
-        timeframe = 120
-        df_price_month = create_dataframe(portfolio, stock, timeframe, period="1M")
-        df_volume = create_dataframe(portfolio, stock, timeframe, period="6M", is_vol=True)
+    print("Searching for Best Model and forecast")
+    exceptions_list = []
+    for stock in tqdm(portfolio, position=0, desc= 'Stocks Forecasting'):
+        try:
+            print(stock)
+            # Create DataFrames
+            df_price_frame = create_dataframe(portfolio, stock, timeframe)
+            timeframe = 120
+            df_price_month = create_dataframe(portfolio, stock, timeframe, period="1M")
+            df_volume = create_dataframe(portfolio, stock, timeframe, period="6M", is_vol=True)
 
-        # Calc Stats
-        price_stats = stocks_stat(df_price_frame['Derivatives'], df_price_frame['Unmasked'])
-        volume_stats = stocks_stat(df_volume['Derivatives'], df_volume['Unmasked'])
-        #Add Stats to Portfolio dict
-        portfolio[stock]['stock_stats'] = {'volume_stats': volume_stats, 'price_stats': price_stats}
-        df_5d_price = create_5d_df(portfolio, stock, timeframe)
-
-        # Timeseries Playground
-        models = [ExponentialSmoothing, RNNModel, TCNModel] #ARIMA,,
-        for model in models:
-            # 10 min period intra-day - 5 Days data
-            plt.close()
-            period = 24*60/10 # 24H*(60Min/10Min)
-            if model == ExponentialSmoothing :
-                curr_model = model(seasonal_periods=period)
-            else:
-                curr_model = model()
-            series = TimeSeries.from_dataframe(df_5d_price, 'DateTime', 'Price', freq='10min', fill_missing_dates=True)
-            series.plot()
-            methods = ['linear','quadratic','cubic','slinear','piecewise']
-            for method in methods:
-                series = fill_missing_values(series,'auto',interpolate_kwargs={'method':method})
-                len_20_percent = int(len(series)*0.2)
-                train, val = series[:-len_20_percent], series[-len_20_percent:]
-
-                curr_model.fit(train)
-                prediction = curr_model.predict(len(val), num_samples=1000)
-                prediction.plot(label=f'{model.__str__(model)} forecast;  Interpolation :{method}', low_quantile=0.05, high_quantile=0.95)
-
-            # 1 Day period  120 business Days data
-            plt.close()
-            period = 7 # 7 days
-            if model == ExponentialSmoothing :
-                curr_model = model(seasonal_periods=period)
-            else:
-                curr_model = model()
-            series = TimeSeries.from_dataframe(df_price_frame, 'DateTime', 'Price', freq='D', fill_missing_dates=True)
-            series.plot()
-            methods = ['linear','quadratic','cubic','slinear','piecewise']
-            for method in methods:
-                series = fill_missing_values(series,'auto',interpolate_kwargs={'method':method})
-                len_20_percent = int(len(series)*0.2)
-                train, val = series[:-len_20_percent], series[-len_20_percent:]
-
-                curr_model.fit(train)
-                prediction = curr_model.predict(len(val), num_samples=1000)
-                prediction.plot(label=f'{model.__str__(model)} forecast;  Interpolation :{method}', low_quantile=0.05, high_quantile=0.95)
-
-
-        # model = AutoARIMA()
-        # model.fit(train)
-        # prediction = model.predict(len(val))
-        # series.plot()
-        # prediction.plot(label='forecast-ARIMA', low_quantile=0.05, high_quantile=0.95)
-        # plt.legend()
+            # Calc Stats
+            price_stats = stocks_stat(df_price_frame['Derivatives'], df_price_frame['Unmasked'])
+            volume_stats = stocks_stat(df_volume['Derivatives'], df_volume['Unmasked'])
+            #Add Stats to Portfolio dict
+            portfolio[stock]['stock_stats'] = {'volume_stats': volume_stats, 'price_stats': price_stats}
+            df_5d_price = create_5d_df(portfolio, stock, timeframe)
 
 
 
-#######################################################################        #####Continue HERE~!
-        plot_fft(df_price_month)
-        plot_fft(df_5d_price)
+            # TODO : add backtesting - check for 1 week preidiction at a time
+            # TODO: add particle filter
+            # Todo: add catch22 implementation for Time series comparison and analysis
 
-        if is_plot:
-            # if not ((price_stats.iloc[:3]['Down']==1).all() or (price_stats.iloc[:3]['Up']==1).all() or (price_stats.iloc[:3]['Down']==1).all()):
-            # x = np.linspace(0, 4, 10)
-            # price_stats.iloc[:3].plot.kde(title = '{}'.format(portfolio[stock]['stock_data']['name']) ,xticks=x)
-            # if (price_stats.iloc[3]>2).any() :
-            # stock_frame = create_dataframe(portfolio,stock,int(timeframe/2),70)
-            # price_stats = stocks_stat(stock_frame['Derivatives'])
-            # Plot Option for manual analysis
-            temp_df = pd.DataFrame.copy(df_price_frame)
-            temp_df_vol = pd.DataFrame.copy(df_volume)
-            corr = temp_df.corrwith(temp_df_vol)
-            temp_df.set_index(['DateTime'], inplace=True)
-            ax = temp_df[['Price_Norm']].plot(
-                title='{}\n Price vs. Volume\n'.format(portfolio[stock]['stock_data']['name'], temp_df[['Price_Norm']]))
-            temp_df_vol.set_index(['DateTime'], inplace=True)
-            temp_df_vol[['Volume_Norm']].plot(ax=ax)
-            temp_df['Volume_Norm'] = temp_df_vol['Volume_Norm']
-            print('Stock {}\n '.format(stock), corr)
-        days_list = sorted(list(portfolio[stock]['stock_data']['6M'].keys()))
-        hour_list = sorted(list(portfolio[stock]['stock_data']['1M'].keys()))
-        date_only_dict = {}
+            # Darts Timeseries Playground
 
-        # Creates Dict - each day with a 30 min delta (except 16:00, closing price)
-        for hour in hour_list:
-            hour_date = parser.parse(hour)
-            date_only = hour_date.strftime("%Y-%m-%d")
-            if date_only not in date_only_dict:
-                hours = []
-                hours.append(hour)
-                date_only_dict[date_only] = hours
-            else:
-                hours.append(hour)
-                date_only_dict[date_only] = hours
-        up_list, down_list, hour_list = [], [], []
-        # Creates Down and Up Lists
-        for day in date_only_dict:
-            if portfolio[stock]['stock_data']['6M'].get(day + ' 16:00:00', None):
-                if portfolio[stock]['stock_data']['6M'][day + ' 16:00:00'].get('close', None) and \
-                        portfolio[stock]['stock_data']['6M'][day + ' 16:00:00'].get('open', None):
-                    if portfolio[stock]['stock_data']['6M'][day + ' 16:00:00'].get('close', None) > \
+            # Kalman Filter noise reduction
+
+
+
+            models = [ExponentialSmoothing()] #ARIMA,,TCNModel,  RNNModel
+            for model in models:
+                # 10 min period intra-day - 5 Days data
+                plt.close()
+                period = 24*60/10 # 24H*(60Min/10Min)
+                # if model == ExponentialSmoothing :
+                #     curr_model = model(seasonal_periods=period)
+                # else:
+                #     curr_model = model()
+                series = TimeSeries.from_dataframe(df_5d_price, 'DateTime', 'Price', freq='10min', fill_missing_dates=True)
+                methods = ['linear','quadratic','cubic','slinear','piecewise']
+                # for method in methods:
+                #     series = fill_missing_values(series,'auto',interpolate_kwargs={'method':method})
+                #     len_20_percent = int(len(series)*0.2)
+                #     train, val = series[:-len_20_percent], series[-len_20_percent:]
+                #
+                #
+                #     filtered_price_5d = KalmanFilter(P=1000., R=50, Q=1).filter(series).values()
+                #     filtered_price_5d_ts = TimeSeries.from_times_and_values(series.time_index, filtered_price_5d)
+                #     train_f, val_f = filtered_price_5d_ts[:-len_20_percent], filtered_price_5d_ts[-len_20_percent:]
+                #
+                #     plt.close()
+                #     series.plot(color='red', label='Noisy')
+                #     filtered_price_5d_ts.plot(color='blue', label='filtered')
+                #
+                #     curr_model.fit(train)
+                #     prediction = curr_model.predict(len(val), num_samples=1000)
+                #     prediction.plot(label=f'{model.__str__(model)} forecast;  Interpolation :{method}', low_quantile=0.05, high_quantile=0.95)
+                #
+                #     curr_model.fit(train_f)
+                #     prediction = curr_model.predict(len(val_f), num_samples=1000)
+                #     prediction.plot(label=f'{model.__str__(model)} Filtered forecast;  Interpolation :{method}', low_quantile=0.05, high_quantile=0.95,  color = 'green')
+
+                # 1 Day period  120 business Days data
+                plt.close()
+                period = 30
+                # for period in range(2, 31, 3):
+                print(f"Period {period}")
+                # period = 7 # 7 days
+                # if model == ExponentialSmoothing:
+                #     curr_model = model(seasonal_periods=period)
+                # else:
+                #     model = model()
+                series = TimeSeries.from_dataframe(df_price_frame, 'DateTime', 'Price', freq='D', fill_missing_dates=True)
+                best_mape = float('inf')
+                best_method = None
+                best_model = None
+
+                methods = ['linear','quadratic','cubic','slinear','piecewise']
+                for method in methods:
+                    series = fill_missing_values(series,'auto',interpolate_kwargs={'method':method})
+                    len_20_percent = int(len(series)*0.2)
+                    train, val = series[:-len_20_percent], series[-len_20_percent:]
+
+
+                    filtered_price_4m = KalmanFilter(P=1000., R=50, Q=1).filter(series).values()
+                    filtered_price_4m_ts = TimeSeries.from_times_and_values(series.time_index, filtered_price_4m)
+                    train_f, val_f = filtered_price_4m_ts[:-len_20_percent], filtered_price_4m_ts[-len_20_percent:]
+
+                    # best_mape, best_model, best_method = search_best_model(train,val,train_f,val_f,method,best_mape,best_model,best_method)
+
+
+                    plt.close()
+                    series.plot(color='red', label='Noisy')
+                    filtered_price_4m_ts.plot(color='blue', label='filtered')
+
+
+                    model.fit(train)
+                    prediction = model.predict(len(val), num_samples=100)
+                    prediction.plot(label=f'{model} forecast;  Interpolation :{method}', low_quantile=0.05, high_quantile=0.95)
+                    print('model {} , interpolation {}, obtains MAPE: {:.2f}%'.format(model, method, mape(val, prediction)))
+
+
+                    if mape(val, prediction) < best_mape:
+                        best_mape = mape(val, prediction)
+                        best_model = model
+                        best_method = method
+
+
+                    model.fit(train_f)
+                    prediction_f = model.predict(len(val_f), num_samples=100)
+                    prediction_f.plot(label=f'{model} Filtered forecast;  Interpolation :{method}', low_quantile=0.05, high_quantile=0.95, color = 'green')
+                    print('model {} , interpolation {}, Filtered, obtains MAPE: {:.2f}%'.format(model, method, mape(val, prediction_f)))
+
+                    if mape(val_f, prediction_f) < best_mape:
+                        best_mape = mape(val_f, prediction_f)
+                        best_model = model
+                        best_method = method
+
+                    # # Theta Model
+                    # plt.close()
+                    # series.plot(color='red', label='Noisy')
+                    # filtered_price_4m_ts.plot(color='blue', label='filtered')
+                    #
+                    # theta = search_theta(train, val)
+                    # pred_theta = train_theta(train, val, theta)
+                    # pred_theta.plot(label=f'{model()} Filtered forecast;  Interpolation :{method}', low_quantile=0.05, high_quantile=0.95)
+                    # print('model {} , interpolation {}, Filtered, obtains MAPE: {:.2f}%'.format(model(), method, mape(val, pred_theta)))
+                    #
+                    # theta_f = search_theta(train_f, val_f)
+                    # pred_theta_f = train_theta(train_f, val_f, theta_f)
+                    # pred_theta_f.plot(label=f'{model()} Filtered forecast;  Interpolation :{method}', low_quantile=0.05, high_quantile=0.95, color = 'green')
+                    # print('model {} , interpolation {}, Filtered, obtains MAPE: {:.2f}%'.format(model(), method, mape(val, pred_theta_f)))
+
+                    plt.close() # TODO: Remove
+
+
+                # backtesting
+                periods_errors, best_period = search_best_forecast_period(best_model, series)
+                print(f"Best Period for Forecast: {best_period}")
+                # plot_hist_with_counts(periods_errors) # TODO:  Uncomment
+                plt.title("Periods error scores (histogram)")
+
+                plt.close() # TODO: Remove
+
+                average_error = best_model.backtest(series, start=0.8, forecast_horizon=best_period,
+                                                          verbose=False)
+                median_error = best_model.backtest(series, start=0.8, forecast_horizon=best_period,
+                                                         reduction=np.median, verbose=False)
+                print("Average error (MAPE) over all historical forecasts: {}".format(average_error))
+                print("Median error (MAPE) over all historical forecasts: {}".format(median_error))
+
+                raw_errors = best_model.backtest(series, start=0.8, forecast_horizon=best_period,
+                                                       reduction=None, verbose=False)
+
+                print(f"1 Week Period for Forecast: ")
+                week_error = best_model.backtest(series, start=0.8, forecast_horizon=7,
+                                                          verbose=False)
+                print("1 Week Average error (MAPE) over all historical forecasts: {}".format(week_error))
+
+
+
+                # plot_hist_with_counts(raw_errors) # TODO:  Uncomment
+                plt.title("Individual error scores (histogram) for best period")
+
+                plt.close()  # TODO: Remove
+
+                series.plot(label='data')
+                plt.legend()
+                historical_fcast = best_model.historical_forecasts(series, start=0.8,
+                                                                               forecast_horizon=best_period, verbose=False)
+                # historical_fcast.plot(label='backtest 3-months ahead forecast (Theta)') # TODO:  Uncomment
+                plt.title('MAPE = {:.2f}%'.format(mape(historical_fcast, series)))
+
+                plt.close() # TODO: Remove
+
+                # plot_residuals_analysis(best_model.residuals(series)) # TODO:  Uncomment
+
+
+            # model = AutoARIMA()
+            # model.fit(train)
+            # prediction = model.predict(len(val))
+            # series.plot()
+            # prediction.plot(label='forecast-ARIMA', low_quantile=0.05, high_quantile=0.95)
+            # plt.legend()
+
+
+
+    #######################################################################        #####Continue HERE~!
+            # plot_fft(df_price_month) # TODO: Uncomment
+            # plot_fft(df_5d_price)
+
+            if is_plot:
+                # if not ((price_stats.iloc[:3]['Down']==1).all() or (price_stats.iloc[:3]['Up']==1).all() or (price_stats.iloc[:3]['Down']==1).all()):
+                # x = np.linspace(0, 4, 10)
+                # price_stats.iloc[:3].plot.kde(title = '{}'.format(portfolio[stock]['stock_data']['name']) ,xticks=x)
+                # if (price_stats.iloc[3]>2).any() :
+                # stock_frame = create_dataframe(portfolio,stock,int(timeframe/2),70)
+                # price_stats = stocks_stat(stock_frame['Derivatives'])
+                # Plot Option for manual analysis
+                temp_df = pd.DataFrame.copy(df_price_frame)
+                temp_df_vol = pd.DataFrame.copy(df_volume)
+                corr = temp_df.corrwith(temp_df_vol)
+                temp_df.set_index(['DateTime'], inplace=True)
+                ax = temp_df[['Price_Norm']].plot(
+                    title='{}\n Price vs. Volume\n'.format(portfolio[stock]['stock_data']['name'], temp_df[['Price_Norm']]))
+                temp_df_vol.set_index(['DateTime'], inplace=True)
+                temp_df_vol[['Volume_Norm']].plot(ax=ax)
+                temp_df['Volume_Norm'] = temp_df_vol['Volume_Norm']
+                print('Stock {}\n '.format(stock), corr)
+            days_list = sorted(list(portfolio[stock]['stock_data']['6M'].keys()))
+            hour_list = sorted(list(portfolio[stock]['stock_data']['1M'].keys()))
+            date_only_dict = {}
+
+            # Creates Dict - each day with a 30 min delta (except 16:00, closing price)
+            for hour in hour_list:
+                hour_date = parser.parse(hour)
+                date_only = hour_date.strftime("%Y-%m-%d")
+                if date_only not in date_only_dict:
+                    hours = []
+                    hours.append(hour)
+                    date_only_dict[date_only] = hours
+                else:
+                    hours.append(hour)
+                    date_only_dict[date_only] = hours
+            up_list, down_list, hour_list = [], [], []
+            # Creates Down and Up Lists
+            for day in date_only_dict:
+                if portfolio[stock]['stock_data']['6M'].get(day + ' 16:00:00', None):
+                    if portfolio[stock]['stock_data']['6M'][day + ' 16:00:00'].get('close', None) and \
                             portfolio[stock]['stock_data']['6M'][day + ' 16:00:00'].get('open', None):
-                        up_list.append(day)
-                    elif portfolio[stock]['stock_data']['6M'][day + ' 16:00:00'].get('close', None) < \
-                            portfolio[stock]['stock_data']['6M'][day + ' 16:00:00'].get('open', None):
-                        down_list.append(day)
+                        if portfolio[stock]['stock_data']['6M'][day + ' 16:00:00'].get('close', None) > \
+                                portfolio[stock]['stock_data']['6M'][day + ' 16:00:00'].get('open', None):
+                            up_list.append(day)
+                        elif portfolio[stock]['stock_data']['6M'][day + ' 16:00:00'].get('close', None) < \
+                                portfolio[stock]['stock_data']['6M'][day + ' 16:00:00'].get('open', None):
+                            down_list.append(day)
 
-        # Creates Correlation Dictionary
-        corr_dict_up = correlate_dict(portfolio, stock, date_only_dict, up_list)
-        corr_dict_down = correlate_dict(portfolio, stock, date_only_dict, down_list)
+            # Creates Correlation Dictionary
+            corr_dict_up = correlate_dict(portfolio, stock, date_only_dict, up_list)
+            corr_dict_down = correlate_dict(portfolio, stock, date_only_dict, down_list)
 
-        # Adds dicts to Portfolio file
-        portfolio[stock]['stock_data']['hourly_correlation'] = {'up': corr_dict_up}
-        portfolio[stock]['stock_data']['hourly_correlation']['down'] = corr_dict_down
+            # Adds dicts to Portfolio file
+            portfolio[stock]['stock_data']['hourly_correlation'] = {'up': corr_dict_up}
+            portfolio[stock]['stock_data']['hourly_correlation']['down'] = corr_dict_down
 
-        # Merge the DataFrames
-        # Sets DateTime as the columns
-        # df_price_frame = df_price_frame.T
-        # df_price_frame.columns = df_price_frame.iloc[0]
-        # df_price_frame.drop('DateTime', axis=0, inplace=True)
-        # df_volume = df_volume.T
-        # df_volume.columns = df_volume.iloc[0]
-        # df_volume.drop('DateTime', axis=0, inplace=True)
-        #df_merged = pd.concat([df_price_frame,df_volume], ignore_index=True)
+            # Merge the DataFrames
+            # Sets DateTime as the columns
+            # df_price_frame = df_price_frame.T
+            # df_price_frame.columns = df_price_frame.iloc[0]
+            # df_price_frame.drop('DateTime', axis=0, inplace=True)
+            # df_volume = df_volume.T
+            # df_volume.columns = df_volume.iloc[0]
+            # df_volume.drop('DateTime', axis=0, inplace=True)
+            #df_merged = pd.concat([df_price_frame,df_volume], ignore_index=True)
 
-        # Adds DataFrames to Portfolio file
-        portfolio[stock]['stock_data']['stock_DataFrame'] = {'3 Month Price DataFrame': df_price_frame, '1 Month Price DataFrame':df_price_month,'3 Months Volume DataFrame':df_volume}
-
-
-        def test_xgb_model(df):
-            y = df['Price'].to_numpy().reshape(-1, 1)
-            y = y[:-1, :]
-            X = df.iloc[:-1,:].drop(columns=['Price','DateTime','Price_Norm'])
-            X_cols = X.columns.tolist()
-            model = train_XGB(X,y, X_cols)
+            # Adds DataFrames to Portfolio file
+            portfolio[stock]['stock_data']['stock_DataFrame'] = {'3 Month Price DataFrame': df_price_frame, '1 Month Price DataFrame':df_price_month,'3 Months Volume DataFrame':df_volume}
 
 
-        test_xgb_model(df_price_frame)
-        test_xgb_model(df_5d_price)
+            def test_xgb_model(df):
+                y = df['Price'].to_numpy().reshape(-1, 1)
+                y = y[:-1, :]
+                X = df.iloc[:-1,:].drop(columns=['Price','DateTime','Price_Norm'])
+                X_cols = X.columns.tolist()
+                model = train_XGB(X,y, X_cols)
+
+
+            test_xgb_model(df_price_frame)
+            test_xgb_model(df_5d_price)
+        except Exception as e:
+            exceptions_list += [f"{stock} Forecasting Exception" + str(e)]
+            continue
+    for exception in exceptions_list:
+        print(exception)
